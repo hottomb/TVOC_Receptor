@@ -1,0 +1,57 @@
+; --- USTAWIENIA GLOBALNE (Dla wszystkich p³ytek w projekcie) ---
+[env]
+; time: dodaje znaczniki czasu do logów
+; esp32_exception_decoder: dekoduje "Guru Meditation Error" na numery linii
+monitor_filters = time, esp32_exception_decoder
+; Przyspieszenie wgrywania po USB
+upload_speed = 921600
+; Uruchamia automatycznie monitor po udanym wgraniu
+targets = upload, monitor
+
+
+; --- WÊZE£ NADAWCZY (ESP32-C3 Supermini z czujnikami i guzikiem) ---
+[env:esp32_c3_supermini]
+platform = espressif32
+board = esp32-c3-devkitm-1
+framework = arduino
+monitor_speed = 500000
+; Wy³¹czenie resetu przy otwieraniu Serial Monitora
+monitor_dtr = 0
+monitor_rts = 0
+; Zignoruj wszystko i weŸ tylko kod nadajnika
+build_src_filter = -<*> +<sonda_button.cpp>
+
+; Biblioteki TYLKO dla wêz³a na balkonie
+lib_deps = 
+    pierremolinaro/ACAN2517FD @ ^2.1.8
+    adafruit/Adafruit SGP30 Sensor @ ^2.0.0
+    adafruit/Adafruit SHTC3 Library @ ^1.0.1
+
+; Flagi kompilatora (Krytyczne dla dzia³ania Serial po fizycznym USB-C w C3)
+build_flags = 
+    -D ARDUINO_USB_MODE=1
+    -D ARDUINO_USB_CDC_ON_BOOT=1
+    -D CORE_DEBUG_LEVEL=1
+
+
+
+; --- WÊZE£ ODBIORCZY (ESP32-CAM jako loger) ---
+[env:esp32cam]
+platform = espressif32
+board = esp32cam
+framework = arduino
+monitor_speed = 115200
+; Wy³¹czenie resetu przy otwieraniu Serial Monitora
+monitor_dtr = 0
+monitor_rts = 0
+; Zignoruj wszystko i weŸ tylko kod bazy
+build_src_filter = -<*> +<base_receptor.cpp>
+
+; Biblioteki dla bazy (Serwer Asynchroniczny - stabilny fork)
+lib_deps =
+    mathieucarbou/ESPAsyncWebServer @ ^3.3.23
+
+; Flagi kompilatora dla CAM
+build_flags = 
+    ; Poziom 0 = 'None'. Ca³kowicie wycina sprzêtowe b³êdy (np. Parsing.cpp SSL) z terminala
+    -D CORE_DEBUG_LEVEL=0
