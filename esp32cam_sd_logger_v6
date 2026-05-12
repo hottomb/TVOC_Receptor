@@ -1,0 +1,1390 @@
+// =============================================================================
+// ESP32-CAM SD Logger Gateway v6.0
+// Architektura: ESP32 Dual-Core Xtensa LX6 | 240MHz | 520KB SRAM | 4MB PSRAM
+// Core 0: WiFi / lwIP / ESP-NOW    Core 1: loop() / sdLoggerTask
+//
+// CHANGELOG v6.0:
+//   [1] STA odłączany po NTP: nowy stan DISCONNECT_STA → WiFi.disconnect(true)
+//       Korzyść: czyste radio half-duplex wyłącznie dla AP + ESP-NOW
+//       Flaga staDisconnected chroni WiFiEvent przed wywołaniem reconnect()
+//   [2] Soft-recovery SD: 3 próby remount (end→begin) z rosnącym opóźnieniem
+//       500ms/1000ms/1500ms przed ESP.restart(). LED_SD_RECOVERY (7 mignięć).
+//   [3] Weryfikacja rozmiaru po flush: logFile.size() vs expectedFileSize
+//       Lekka (stat FAT, bez re-read). Niezgodność → sdWriteError → remount.
+//   [4] struct_message: IDENTYCZNA z nadajnikiem ESP32-C3 (152B, bez event_type)
+//       Kod nadajnika NIE jest modyfikowany.
+//   [5] QueuedPacket: wrapper kolejki z senderMac[6] z callbacku OnDataRecv
+//       Identyfikacja spośród 3 modułów nadajnikowych po MAC adresie.
+//   [6] EVENT_TYPE dedukowany przez parsowanie text_data (strstr):
+//       "TYPE:TRIGGER" → BTN_PRESS (kotwica ML/RL, naciśnięcie przez człowieka)
+//       brak tokenu    → TVOC (pomiar czujnika, częstotliwość z TIMESTAMP)
+//   [7] CSV: TIMESTAMP,VERDICT,SENDER_MAC,SEQ_NUM,EVENT_TYPE,PAYLOAD
+//   [8] TEMP_LINE_SIZE zwiększony do 320B (payload 140B + nagłówki + margines)
+// =============================================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <rom/crc.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include "FS.h"
+#include "SD_MMC.h"
+#include "time.h"
+#include <atomic>
+#include <esp_task_wdt.h>
+#include "esp_heap_caps.h"
+
+// =============================================================================
+// KONFIGURACJA SYSTEMU
+// Credentials WiFi domowego — używane TYLKO do synchronizacji NTP.
+// Po uzyskaniu czasu STA jest odłączane (WiFi.disconnect(true)).
+// Hasło AP pochodzi z NVS (klucz "pass"), fallback: "admin123".
+// =============================================================================
+const char* ssid               = "motorola";       // SSID sieci domowej (NTP)
+const char* password           = "japko123456";    // Hasło sieci domowej (NTP)
+const char* ntpServer          = "pool.ntp.org";
+const long  gmtOffset_sec      = 3600;             // UTC+1
+const int   daylightOffset_sec = 3600;             // DST +1h
+
+#define WDT_TIMEOUT_SECONDS     45
+
+// =============================================================================
+// KONFIGURACJA SPRZĘTU (ESP32-CAM Ai-Thinker)
+// GPIO33 — LED czerwona (active LOW)
+// GPIO16 — przycisk managera (bezpieczny pin, bez konfliktu SDIO)
+// =============================================================================
+#define RED_LED_PIN        33
+#define MANAGER_BUTTON_PIN 16
+
+// =============================================================================
+// LED – MASZYNA STANÓW
+// =============================================================================
+struct LedPattern { uint16_t on_ms, off_ms; uint8_t count; uint16_t pause_ms; };
+
+enum LedMode {
+    LED_OFF_MODE = 0,
+    LED_BOOT,           // ●●● ⋯1s    — inicjalizacja
+    LED_WIFI_WAIT,      // ● ⋯⋯⋯⋯     — czeka na WiFi/NTP
+    LED_NTP_WAIT,       // ●● ⋯1s     — sync NTP
+    LED_SD_INIT,        // ●●● ⋯0.5s  — init SD
+    LED_AP_INIT,        // ●●●● ⋯1s   — start AP
+    LED_RUNNING,        // ● ⋯⋯⋯⋯⋯⋯  — normalna praca (1 co 3s)
+    LED_SERVICE_MODE,   // ●○●○       — tryb serwisowy (200ms)
+    LED_ERROR_SD,       // ●●●●● ⋯2s  — błąd SD
+    LED_ERROR_ESPNOW,   // ●● ⋯0.5s   — błąd radio
+    LED_CAPTIVE_PORTAL, // ●●● ⋯2s    — AP bez STA (offline)
+    LED_DEADTIME,       // ● ⋯⋯⋯⋯    — cooldown po serwisie
+    LED_SD_RECOVERY,    // ●●●●●●● ⋯1s — próba remount SD
+};
+
+const LedPattern LED_PATTERNS[] = {
+    {0,   0,   0, 0    },  // OFF
+    {80,  80,  3, 1000 },  // BOOT
+    {150, 850, 0, 0    },  // WIFI_WAIT
+    {80,  80,  2, 1000 },  // NTP_WAIT
+    {80,  80,  3, 500  },  // SD_INIT
+    {80,  80,  4, 1000 },  // AP_INIT
+    {200, 2800,0, 0    },  // RUNNING
+    {200, 200, 0, 0    },  // SERVICE_MODE
+    {80,  80,  5, 2000 },  // ERROR_SD
+    {80,  80,  2, 500  },  // ERROR_ESPNOW
+    {100, 100, 3, 2000 },  // CAPTIVE_PORTAL
+    {100, 1900,0, 0    },  // DEADTIME
+    {60,  60,  7, 1000 },  // SD_RECOVERY: ●●●●●●● ⋯1s (szybkie, dużo)
+};
+
+LedMode       currentLedMode = LED_BOOT;
+uint8_t       ledBlink       = 0;
+bool          ledState       = false;
+unsigned long ledTimer       = 0;
+bool          ledInPause     = false;
+
+void ledUpdate() {
+    const LedPattern& p = LED_PATTERNS[currentLedMode];
+    if (p.on_ms == 0 && p.off_ms == 0) { digitalWrite(RED_LED_PIN, HIGH); return; }
+    unsigned long now = millis(), elapsed = now - ledTimer;
+    if (ledInPause) {
+        if (elapsed >= p.pause_ms) { ledInPause = false; ledBlink = 0; ledTimer = now; }
+        return;
+    }
+    if (elapsed < (uint16_t)(ledState ? p.on_ms : p.off_ms)) return;
+    ledTimer = now;
+    if (!ledState && p.count > 0) {
+        if (++ledBlink >= p.count) {
+            if (p.pause_ms > 0) { ledInPause = true; ledBlink = 0; digitalWrite(RED_LED_PIN, HIGH); return; }
+            ledBlink = 0;
+        }
+    }
+    ledState = !ledState;
+    digitalWrite(RED_LED_PIN, ledState ? LOW : HIGH);
+}
+
+void setLedMode(LedMode mode) {
+    if (currentLedMode == mode) return;
+    currentLedMode = mode; ledBlink = 0; ledState = false; ledInPause = false;
+    ledTimer = millis(); digitalWrite(RED_LED_PIN, HIGH);
+}
+
+// =============================================================================
+// KONFIGURACJA LOGOWANIA I ROTACJI
+// =============================================================================
+#define MAX_LOG_SIZE_MB     20
+#define MAX_LOG_AGE_H       24
+const uint64_t MAX_LOG_SIZE_BYTES  = (uint64_t)MAX_LOG_SIZE_MB * 1024ULL * 1024ULL;
+const uint32_t MAX_LOG_AGE_MS      = (uint32_t)MAX_LOG_AGE_H  * 3600UL  * 1000UL;
+const uint64_t MIN_FREE_SPACE_BYTES = 10ULL * 1024ULL * 1024ULL;
+#define MAX_FILES_LISTED    50
+
+// =============================================================================
+// KONFIGURACJA TRYBU SERWISOWEGO
+// =============================================================================
+#define SVC_SESSION_TIMEOUT_MS  300000UL   // 5 minut max sesja download
+#define SVC_DEADTIME_MS          30000UL   // 30s deadtime po rozłączeniu
+
+// =============================================================================
+// BUFOR TRANSFERU I LOGOWANIA
+// =============================================================================
+#define WRITE_BUFFER_SIZE    2048
+// TEMP_LINE_SIZE: maksymalna długość jednej linii CSV
+// Szacunek: timestamp(19) + verdict(7) + MAC(17) + seq(10) + evtStr(9)
+//           + separatory(5) + cudzysłowy(2) + payload(do 140×2 w worst-case) + \n
+// Worst-case payload (każdy znak to ""): 140×2 = 280B → całość ~340B
+// Ustawiamy 320B: payload zawiera czytelny tekst ASCII, podwojenie cudzysłowów
+// jest skrajnie rzadkie (w text_data nadajnika nie ma cudzysłowów)
+#define TEMP_LINE_SIZE        320
+#define DOWNLOAD_BUFFER_SIZE 32768  // 32KB z PSRAM
+
+// =============================================================================
+// STRUKTURY DANYCH
+//
+// struct_message — IDENTYCZNA z nadajnikiem (ESP32-C3). Nie wolno modyfikować.
+//   sizeof = 4+4+140+4 = 152B
+//   CRC32 obejmuje wszystkie pola przed crc32 (offsetof(struct_message, crc32)).
+//
+// Identyfikacja typu zdarzenia i modułu nadajnika:
+//   event_type  — dedukowany po odbiorze przez parsowanie text_data:
+//                 strstr(text_data,"TYPE:TRIGGER") → BTN_PRESS
+//                 brak tokenu                      → TVOC
+//                 Nadajnik nie zmienia struktury — typ jest w treści wiadomości.
+//
+//   sender_mac  — MAC nadawcy z parametru callbacku OnDataRecv.
+//                 Jedyna pewna metoda identyfikacji spośród 3 modułów.
+//                 Przechowywany w QueuedPacket (wrapper kolejki).
+//
+// Nadajnik może wysyłać 3 warianty text_data:
+//   "SEQ:N TYPE:TRIGGER ACTION:CLICK"               — przycisk (kotwica ML)
+//   "S:N T:X RH:X AH:X TVOC:X CO2:X rH2:X rEtOH:X" — czujnik 1Hz
+//   "S:N rH2:X rEtOH:X"                             — surowe dane 5Hz
+// =============================================================================
+
+typedef struct __attribute__((packed)) struct_message {
+    uint32_t seq_num;     // numer sekwencyjny (RTC_DATA_ATTR na nadajniku)
+    uint32_t uptime;      // millis() nadajnika w chwili wysyłki
+    char     text_data[140]; // payload tekstowy — patrz warianty powyżej
+    uint32_t crc32;       // CRC32 wszystkich pól przed tym polem
+} struct_message;
+// sizeof = 4+4+140+4 = 152B — identyczny z nadajnikiem
+
+// Wrapper kolejki: struct_message + MAC nadawcy (6B, z callbacku ESP-NOW)
+// QueuedPacket nigdy nie jest wysyłany przez radio — tylko wewnętrznie w RTOS
+typedef struct {
+    uint8_t        senderMac[6];  // MAC z parametru OnDataRecv
+    struct_message payload;
+} QueuedPacket;
+// sizeof = 6 + 152 = 158B → rxQueue: 48 × 158B = ~7.6KB SRAM
+
+enum CommandType { CMD_NONE, CMD_ROTATE_FILE, CMD_DELETE_FILE, CMD_CLEAR_ALL };
+typedef struct { CommandType type; char targetFile[64]; } IPC_Command;
+
+// =============================================================================
+// ZASOBY WSPÓŁDZIELONE
+// =============================================================================
+QueueHandle_t     rxQueue          = NULL;   // 48 × QueuedPacket (~7.6KB SRAM)
+QueueHandle_t     controlQueue     = NULL;   // 10 × IPC_Command
+TaskHandle_t      loggerTaskHandle = NULL;
+SemaphoreHandle_t sdMutex          = NULL;
+SemaphoreHandle_t downloadReadySemaphore = NULL;
+
+std::atomic<bool>     sdMounted(false);
+std::atomic<bool>     fileRotationComplete(true);
+std::atomic<bool>     loggerTaskRunning(false);
+std::atomic<bool>     downloadInProgress(false);
+std::atomic<bool>     loggerResumed(true);
+std::atomic<uint32_t> downloadSessionStart(0);
+std::atomic<uint32_t> lastClientDisconnectMs(0);
+
+// Flaga błędu zapisu SD (sygnalizuje potrzebę remount)
+std::atomic<bool>     sdWriteError(false);
+
+char currentFileName[64] = {0};
+char sealedFileName[64]  = {0};
+
+struct DownloadSession { File file; size_t fileSize; uint8_t* buffer; bool bufferValid; };
+static DownloadSession dlSession = { File(), 0, nullptr, false };
+
+AsyncWebServer server(80);
+DNSServer      dnsServer;
+Preferences    prefs;
+
+char    apPassword[64];
+uint8_t operatingChannel = 1;
+bool    staDisconnected  = false;  // True po odłączeniu STA po NTP
+
+bool     isCaptivePortalMode = false;
+bool     bootCountCleared    = false;
+uint32_t bootCountGlobal     = 0;
+
+std::atomic<uint32_t> droppedPackets(0);
+std::atomic<uint32_t> sequenceGaps(0);
+std::atomic<uint32_t> lastSeqNum(0);
+std::atomic<uint32_t> lastPacketMillis(0);
+
+// =============================================================================
+// STANY SYSTEMU
+// Nowy stan: DISCONNECT_STA — odłączanie STA po NTP przed startem AP
+// =============================================================================
+enum SystemState {
+    INIT_WIFI, WAIT_WIFI, SYNC_NTP, WAIT_NTP,
+    DISCONNECT_STA,   // [v6] Odłącz STA po NTP, przejdź do WIFI_AP only
+    INIT_SD, INIT_AP, OPEN_FILE, INIT_ESPNOW,
+    RUNNING, SYSTEM_ERROR, ERROR_SD_FULL
+};
+SystemState   currentState   = INIT_WIFI;
+unsigned long stateEnterTime = 0;
+
+// =============================================================================
+// HTML W PROGMEM (identyczny z v5, bez zmian)
+// =============================================================================
+const char MANAGER_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang='pl'>
+<head>
+<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>TVOC Gateway</title>
+<style>
+:root{--bg:#f1f5f9;--panel:#fff;--acc:#0284c7;--red:#ef4444;--grn:#22c55e;--orn:#f59e0b;--bdr:#cbd5e1}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Segoe UI,sans-serif;background:var(--bg);padding:12px;display:flex;justify-content:center}
+.card{background:var(--panel);padding:20px;border-radius:12px;width:100%;max-width:540px;box-shadow:0 8px 24px rgba(0,0,0,.1);border:1px solid var(--bdr)}
+h2{font-size:1.15rem;margin-bottom:14px;color:#1e293b}
+h3{font-size:.9rem;margin:10px 0 8px;color:#334155}
+.row{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px}
+.btn{border:none;padding:9px 13px;border-radius:7px;cursor:pointer;font-weight:600;font-size:.82rem;color:#fff;transition:opacity .15s}
+.btn:hover{opacity:.82}.btn:disabled{opacity:.35;cursor:not-allowed}
+.acc{background:var(--acc)}.red{background:var(--red)}.grn{background:var(--grn)}.orn{background:var(--orn);color:#1e293b}
+ul{list-style:none}
+li{padding:9px 11px;border:1px solid var(--bdr);border-radius:7px;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.fname{font-size:.85rem;word-break:break-all;flex:1}
+.fsize{font-size:.78rem;color:#64748b;white-space:nowrap}
+.fbtns{display:flex;gap:4px;flex-shrink:0}
+.banner{border-radius:7px;padding:9px 12px;margin-bottom:10px;font-size:.82rem}
+.banner-svc{background:#fef3c7;border:1px solid var(--orn);color:#92400e}
+hr{border:none;border-top:1px solid var(--bdr);margin:10px 0}
+#prog-wrap{display:none;margin-bottom:10px}
+#prog-bg{background:#e2e8f0;border-radius:99px;height:9px;overflow:hidden}
+#prog-bar{height:100%;background:var(--acc);width:0%;transition:width .25s}
+#prog-lbl{font-size:.78rem;color:#64748b;margin-top:4px}
+</style>
+</head>
+<body><div class='card'>
+<h2>&#128225; TVOC Gateway v6</h2>
+%%BANNER%%
+<div id='prog-wrap'>
+  <div id='prog-bg'><div id='prog-bar'></div></div>
+  <div id='prog-lbl'>Przygotowanie...</div>
+</div>
+<div class='row'>
+  <button id='btn-all' class='btn grn' onclick='downloadAll()'>&#8659; Pobierz wszystko</button>
+  <button class='btn acc' onclick='reqRotate()'>&#128274; Zapieczętuj log</button>
+</div>
+<div class='row'>
+  <button class='btn red' onclick='clearAll()'>&#128465; Wyczyść kartę SD</button>
+</div>
+<hr>%%SDINFO%%
+<h3>Zarchiwizowane logi:</h3>
+<ul>%%FILELIST%%</ul>
+</div>
+<script>
+async function downloadAll(){
+  const btn=document.getElementById('btn-all');
+  btn.disabled=true;
+  let files;
+  try{const r=await fetch('/filelist');if(!r.ok)throw new Error(r.status);files=await r.json();}
+  catch(e){alert('Blad listy: '+e);btn.disabled=false;return;}
+  if(!files||!files.length){alert('Brak plikow.');btn.disabled=false;return;}
+  const wrap=document.getElementById('prog-wrap');
+  const bar=document.getElementById('prog-bar');
+  const lbl=document.getElementById('prog-lbl');
+  wrap.style.display='block';
+  for(let i=0;i<files.length;i++){
+    const fn=files[i];
+    bar.style.width=Math.round(i/files.length*100)+'%';
+    lbl.textContent='Pobieranie '+(i+1)+'/'+files.length+': '+fn;
+    try{
+      const r=await fetch('/download?file='+encodeURIComponent(fn));
+      if(!r.ok){lbl.textContent='BLAD '+r.status+': '+fn+' - pomijam';await wait(1500);continue;}
+      const blob=await r.blob();
+      saveBlob(blob,fn);
+    }catch(e){lbl.textContent='Blad sieci: '+fn+' - '+e;await wait(2000);}
+    await waitSvcReady(4000);
+  }
+  bar.style.width='100%';
+  lbl.textContent='Pobrano '+files.length+' plik(ow). Gotowe.';
+  btn.disabled=false;
+}
+function saveBlob(blob,name){
+  const u=URL.createObjectURL(blob);const a=document.createElement('a');
+  a.href=u;a.download=name;document.body.appendChild(a);a.click();
+  document.body.removeChild(a);URL.revokeObjectURL(u);
+}
+async function waitSvcReady(timeout){
+  const t0=Date.now();
+  while(Date.now()-t0<timeout){
+    try{const r=await fetch('/svc_status');const s=await r.text();if(s==='READY')return;}catch(_){}
+    await wait(200);
+  }
+}
+function wait(ms){return new Promise(r=>setTimeout(r,ms));}
+function dlFile(fn){
+  fetch('/download?file='+encodeURIComponent(fn))
+    .then(r=>{if(!r.ok)throw new Error(r.status);return r.blob();})
+    .then(b=>saveBlob(b,fn)).catch(e=>alert('Blad: '+e));
+}
+function delFile(fn){
+  if(!confirm('Usunac: '+fn+'?'))return;
+  const fd=new FormData();fd.append('file',fn);
+  fetch('/delete',{method:'POST',body:fd}).then(r=>{if(r.ok)setTimeout(()=>location.reload(),600);});
+}
+function reqRotate(){
+  fetch('/rotate',{method:'POST'}).then(r=>{
+    if(!r.ok){alert('Blad: '+r.status);return;}
+    let n=0;
+    const t=setInterval(()=>{
+      fetch('/rotation_status').then(r2=>r2.text()).then(s=>{
+        if(s==='DONE'||++n>30){clearInterval(t);location.reload();}
+      });
+    },500);
+  });
+}
+function clearAll(){
+  if(!confirm('Usunac WSZYSTKIE zarchiwizowane logi?\nAktywny log zostanie zachowany.'))return;
+  fetch('/clear',{method:'POST'}).then(r=>{if(r.ok)setTimeout(()=>location.reload(),1000);});
+}
+</script>
+</body></html>
+)rawliteral";
+
+// Nagłówek CSV
+// EVENT_TYPE dedukowany z text_data (brak pola w strukturze — nadajnik niezmieniony)
+const char HEADER_CSV[] = "TIMESTAMP,VERDICT,SENDER_MAC,SEQ_NUM,EVENT_TYPE,PAYLOAD\n";
+
+// =============================================================================
+// FUNKCJE POMOCNICZE
+// =============================================================================
+void changeState(SystemState newState) { currentState = newState; stateEnterTime = millis(); }
+
+bool isFileNameSafe(const char* name) {
+    if (!name || strlen(name) == 0 || strstr(name, "..")) return false;
+    for (size_t i = 0; i < strlen(name); i++) {
+        char c = name[i];
+        if (!isalnum(c) && c != '.' && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
+bool checkSDFreeSpace() {
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        uint64_t total = SD_MMC.totalBytes(), used = SD_MMC.usedBytes();
+        xSemaphoreGive(sdMutex);
+        return (used <= total) && ((total - used) > MIN_FREE_SPACE_BYTES);
+    }
+    return false;
+}
+
+// Unikalna nazwa zapieczętowanego logu: YYYYMMDD_HHMMSS [+ _NNN]
+// Musi być wywoływana POD sdMutex (używa SD_MMC.exists())
+void makeUniqueSealedName(char* buf, size_t bufSize) {
+    struct tm tI;
+    char base[52];
+    if (getLocalTime(&tI, 0))
+        snprintf(base, sizeof(base), "/LOG_SEALED_%04d%02d%02d_%02d%02d%02d",
+                 tI.tm_year+1900, tI.tm_mon+1, tI.tm_mday, tI.tm_hour, tI.tm_min, tI.tm_sec);
+    else
+        snprintf(base, sizeof(base), "/LOG_SEALED_%lu", millis());
+    snprintf(buf, bufSize, "%s.csv", base);
+    if (!SD_MMC.exists(buf)) return;
+    for (int n = 1; n <= 999; n++) {
+        snprintf(buf, bufSize, "%s_%03d.csv", base, n);
+        if (!SD_MMC.exists(buf)) return;
+    }
+    snprintf(buf, bufSize, "%s_%lu.csv", base, millis());
+}
+
+// Formatuje MAC jako "AA:BB:CC:DD:EE:FF" do bufora 18B
+void macToStr(const uint8_t* mac, char* buf) {
+    snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// =============================================================================
+// SOFT-RECOVERY SD
+// Próbuje odmontować i remontować kartę SD bez pełnego restartu systemu.
+// Wywoływana z sdLoggerTask pod sdMutex gdy wykryty błąd zapisu.
+// Parametry: logFile (przez referencję) — zostanie zamknięty i ponownie otwarty.
+// Zwraca: true jeśli remount się powiódł i plik jest otwarty.
+//
+// Dlaczego 3 próby z opóźnieniem:
+//   Karta SD może mieć chwilową utratę kontaktu (wibracje, brownout).
+//   Pierwsze 500ms: kondensatory na linii zasilania rekuperują.
+//   Kolejne próby: dają czas FAT driverowi na wewnętrzne resety.
+// =============================================================================
+bool attemptSDRemount(File& logFile, const char* fileName) {
+    const int MAX_REMOUNT_TRIES = 3;
+    for (int attempt = 1; attempt <= MAX_REMOUNT_TRIES; attempt++) {
+        setLedMode(LED_SD_RECOVERY);
+        Serial.printf("[SD-RECOVERY] Próba %d/%d\n", attempt, MAX_REMOUNT_TRIES);
+
+        // Zamknij plik jeśli otwarty
+        if (logFile) logFile.close();
+
+        // Odmontuj VFS
+        SD_MMC.end();
+        vTaskDelay(pdMS_TO_TICKS(500 * attempt)); // Rosnące opóźnienie: 500, 1000, 1500ms
+
+        // Próba remount
+        if (SD_MMC.begin("/sdcard", true)) {
+            // Sprawdź wolne miejsce
+            uint64_t total = SD_MMC.totalBytes(), used = SD_MMC.usedBytes();
+            if (used > total || (total - used) < MIN_FREE_SPACE_BYTES) {
+                Serial.println("[SD-RECOVERY] Brak miejsca na SD po remount!");
+                sdMounted.store(false, std::memory_order_release);
+                return false;
+            }
+
+            // Ponowne otwarcie pliku logu
+            logFile = SD_MMC.open(fileName, FILE_APPEND);
+            if (logFile) {
+                sdMounted.store(true, std::memory_order_release);
+                sdWriteError.store(false, std::memory_order_release);
+                Serial.printf("[SD-RECOVERY] OK po próbie %d. Log: %s\n", attempt, fileName);
+                return true;
+            }
+        }
+        Serial.printf("[SD-RECOVERY] Próba %d nieudana.\n", attempt);
+    }
+
+    // Wszystkie próby wyczerpane
+    Serial.println("[FATAL] SD remount nieudany po 3 próbach. Restart sprzętowy.");
+    sdMounted.store(false, std::memory_order_release);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP.restart();
+    return false; // Nigdy nie dotrzemy tutaj
+}
+
+// =============================================================================
+// WiFi EVENT
+// =============================================================================
+static unsigned long lastWifiDrop = 0;
+void WiFiEvent(WiFiEvent_t event) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        // Ignoruj zdarzenie jeśli sami odłączyliśmy STA po NTP
+        if (staDisconnected) return;
+        Serial.println("[WiFi] Utracono STA.");
+        if (millis() - lastWifiDrop > 15000) { lastWifiDrop = millis(); WiFi.reconnect(); }
+    }
+}
+
+// =============================================================================
+// ESP-NOW CALLBACK (ISR, Core 0)
+// Pakuje MAC + payload do QueuedPacket i wysyła do rxQueue
+// =============================================================================
+void IRAM_ATTR OnDataRecv(const uint8_t* mac, const uint8_t* incomingData, int len) {
+    if (!rxQueue || len != sizeof(struct_message)) return;
+    QueuedPacket pkt;
+    memcpy(pkt.senderMac, mac, 6);
+    memcpy(&pkt.payload, incomingData, sizeof(struct_message));
+    BaseType_t xHPW = pdFALSE;
+    if (xQueueSendFromISR(rxQueue, &pkt, &xHPW) != pdTRUE)
+        droppedPackets.fetch_add(1, std::memory_order_relaxed);
+    if (xHPW) portYIELD_FROM_ISR();
+}
+
+// =============================================================================
+// SD LOGGER TASK (Core 1, stos 12288B, priorytet 1)
+//
+// Format CSV (v6):
+//   TIMESTAMP   — czas lokalny z NTP (lub epoch jeśli offline)
+//   VERDICT     — VALID / CRC_ERR (weryfikacja CRC32 pakietu ESP-NOW)
+//   SENDER_MAC  — MAC nadajnika (identyfikacja modułu spośród max. 3)
+//   SEQ_NUM     — numer sekwencyjny z nadajnika (detekcja luk transmisji)
+//   EVENT_TYPE  — BTN_PRESS (kotwica ML) lub TVOC (pomiar czujnika)
+//                 Dedukowany z text_data przez strstr("TYPE:TRIGGER").
+//                 Częstotliwość pomiarów TVOC jest konfigurowalna po stronie
+//                 nadajnika — odbiorca jej nie zakłada. Odtwarzalna z TIMESTAMP.
+//   PAYLOAD     — oryginalna treść text_data z nadajnika (bez modyfikacji)
+//
+// Weryfikacja rozmiaru po flush:
+//   logFile.size() vs expectedFileSize → niezgodność → sdWriteError → remount
+// =============================================================================
+void sdLoggerTask(void* pvParameters) {
+    loggerTaskRunning.store(true, std::memory_order_release);
+    esp_task_wdt_add(NULL);
+
+    QueuedPacket pkt;
+    IPC_Command  cmd;
+    File         logFile;
+
+    char* writeBuffer = (char*)heap_caps_malloc(WRITE_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    char* tempLine    = (char*)heap_caps_malloc(TEMP_LINE_SIZE,    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    if (!writeBuffer || !tempLine) {
+        Serial.println("[FATAL] OOM: brak SRAM dla buforów loggera!");
+        if (writeBuffer) free(writeBuffer);
+        if (tempLine)    free(tempLine);
+        loggerTaskRunning.store(false, std::memory_order_release);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Otwarcie pliku logu
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        logFile = SD_MMC.open(currentFileName, FILE_APPEND);
+        if (logFile && logFile.size() == 0) {
+            logFile.write((const uint8_t*)HEADER_CSV, sizeof(HEADER_CSV)-1);
+            logFile.flush();
+        }
+        if (!logFile) {
+            Serial.printf("[SD] BLAD otwarcia: %s\n", currentFileName);
+            sdMounted.store(false, std::memory_order_release);
+        }
+        xSemaphoreGive(sdMutex);
+    }
+
+    size_t        currentBufferLen = 0;
+    size_t        expectedFileSize = 0; // Śledzenie oczekiwanego rozmiaru pliku
+    TickType_t    lastFlush        = xTaskGetTickCount();
+    unsigned long logOpenTime      = millis();
+    unsigned long lastTimeUpdate   = 0;
+    char          localTimeStr[24] = "1970-01-01 00:00:00";
+    loggerResumed.store(true, std::memory_order_release);
+
+    // Inicjalizacja expectedFileSize na podstawie aktualnego rozmiaru
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (logFile) expectedFileSize = logFile.size();
+        xSemaphoreGive(sdMutex);
+    }
+
+    while (true) {
+        esp_task_wdt_reset();
+
+        // =================================================================
+        // SOFT-RECOVERY SD (jeśli wykryto błąd zapisu)
+        // Obsługiwany na początku pętli zanim cokolwiek innego
+        // =================================================================
+        if (sdWriteError.load(std::memory_order_acquire)) {
+            Serial.println("[SD] Wykryto błąd zapisu. Inicjacja soft-recovery.");
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
+                bool ok = attemptSDRemount(logFile, currentFileName);
+                xSemaphoreGive(sdMutex);
+                if (ok) {
+                    currentBufferLen = 0; // Bufor stracony podczas recovery — akceptowalne
+                    lastFlush        = xTaskGetTickCount();
+                    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                        if (logFile) expectedFileSize = logFile.size();
+                        xSemaphoreGive(sdMutex);
+                    }
+                    setLedMode(LED_RUNNING);
+                }
+                // Jeśli !ok → attemptSDRemount wywołał ESP.restart(), nie dotrzemy tutaj
+            }
+        }
+
+        // =================================================================
+        // TRYB SERWISOWY
+        // =================================================================
+        if (downloadInProgress.load(std::memory_order_acquire)) {
+            loggerResumed.store(false, std::memory_order_release);
+            Serial.println("[SVC] Wejście: flush i zawieszenie.");
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                if (logFile) {
+                    if (currentBufferLen > 0) {
+                        logFile.write((const uint8_t*)writeBuffer, currentBufferLen);
+                        currentBufferLen = 0;
+                    }
+                    logFile.flush();
+                    logFile.close();
+                }
+                xSemaphoreGive(sdMutex);
+            }
+            xSemaphoreGive(downloadReadySemaphore);
+            while (downloadInProgress.load(std::memory_order_acquire)) {
+                esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            // Wznowienie
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                logFile = SD_MMC.open(currentFileName, FILE_APPEND);
+                if (!logFile) {
+                    Serial.println("[SD] BLAD ponownego otwarcia po SVC!");
+                    sdMounted.store(false, std::memory_order_release);
+                } else {
+                    expectedFileSize = logFile.size();
+                    Serial.println("[SVC] Logowanie wznowione.");
+                }
+                xSemaphoreGive(sdMutex);
+            }
+            lastFlush = xTaskGetTickCount(); logOpenTime = millis();
+            loggerResumed.store(true, std::memory_order_release);
+            continue;
+        }
+
+        // =================================================================
+        // NORMALNA PRACA
+        // =================================================================
+        unsigned long nowMs = millis();
+        if (nowMs - lastTimeUpdate >= 1000) {
+            struct tm tI;
+            if (getLocalTime(&tI, 0))
+                snprintf(localTimeStr, sizeof(localTimeStr),
+                         "%04d-%02d-%02d %02d:%02d:%02d",
+                         tI.tm_year+1900, tI.tm_mon+1, tI.tm_mday,
+                         tI.tm_hour, tI.tm_min, tI.tm_sec);
+            lastTimeUpdate = nowMs;
+        }
+
+        // Drain komend IPC
+        while (xQueueReceive(controlQueue, &cmd, 0) == pdTRUE) {
+            switch (cmd.type) {
+            case CMD_ROTATE_FILE: {
+                if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                    if (logFile) {
+                        if (currentBufferLen > 0) {
+                            logFile.write((const uint8_t*)writeBuffer, currentBufferLen);
+                            currentBufferLen = 0;
+                        }
+                        logFile.flush(); logFile.close();
+                    }
+                    makeUniqueSealedName(sealedFileName, sizeof(sealedFileName));
+                    if (!SD_MMC.rename(currentFileName, sealedFileName))
+                        Serial.printf("[SD] BLAD rename → %s\n", sealedFileName);
+                    else
+                        Serial.printf("[SD] Zapieczetowano: %s\n", sealedFileName);
+                    // Nowa nazwa pod mutexem (z sekundami — brak kolizji)
+                    struct tm tNew;
+                    if (getLocalTime(&tNew, 0))
+                        snprintf(currentFileName, sizeof(currentFileName),
+                                 "/LOG_%04d%02d%02d_%02d%02d%02d.csv",
+                                 tNew.tm_year+1900, tNew.tm_mon+1, tNew.tm_mday,
+                                 tNew.tm_hour, tNew.tm_min, tNew.tm_sec);
+                    else
+                        snprintf(currentFileName, sizeof(currentFileName),
+                                 "/LOG_BOOT_%lu.csv", millis());
+                    logFile = SD_MMC.open(currentFileName, FILE_APPEND);
+                    if (!logFile) {
+                        Serial.println("[SD] BLAD nowego pliku po rotacji!");
+                        sdMounted.store(false, std::memory_order_release);
+                    } else {
+                        logFile.write((const uint8_t*)HEADER_CSV, sizeof(HEADER_CSV)-1);
+                        logFile.flush();
+                        expectedFileSize = logFile.size();
+                        Serial.printf("[SD] Nowy log: %s\n", currentFileName);
+                    }
+                    xSemaphoreGive(sdMutex);
+                }
+                logOpenTime = millis();
+                fileRotationComplete.store(true, std::memory_order_release);
+                break;
+            }
+            case CMD_DELETE_FILE: {
+                char path[70];
+                int ret = snprintf(path, sizeof(path), "/%s", cmd.targetFile);
+                if (ret > 0 && ret < (int)sizeof(path)) {
+                    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                        char safeCur[64]; strncpy(safeCur, currentFileName, 63); safeCur[63]='\0';
+                        if (strcmp(path, safeCur) != 0) SD_MMC.remove(path);
+                        xSemaphoreGive(sdMutex);
+                    }
+                }
+                break;
+            }
+            case CMD_CLEAR_ALL: {
+                const int MAX_DEL = 50; char toDelete[MAX_DEL][64]; int count = 0;
+                if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                    char safeCur[64]; strncpy(safeCur, currentFileName, 63); safeCur[63]='\0';
+                    File root = SD_MMC.open("/");
+                    if (root) {
+                        File f = root.openNextFile();
+                        while (f && count < MAX_DEL) {
+                            char path[70]; int r2 = snprintf(path, sizeof(path), "/%s", f.name());
+                            f.close();
+                            if (r2>0 && r2<(int)sizeof(path) && strstr(path,".csv") && strcmp(path,safeCur)!=0) {
+                                strncpy(toDelete[count], path, 63); toDelete[count++][63]='\0';
+                            }
+                            f = root.openNextFile();
+                        }
+                        root.close();
+                    }
+                    for (int i=0; i<count; i++) SD_MMC.remove(toDelete[i]);
+                    xSemaphoreGive(sdMutex);
+                }
+                break;
+            }
+            default: break;
+            }
+        }
+
+        // =================================================================
+        // ODBIÓR PAKIETU ESP-NOW
+        // =================================================================
+        if (xQueueReceive(rxQueue, &pkt, pdMS_TO_TICKS(100)) == pdTRUE) {
+            lastPacketMillis.store((uint32_t)millis(), std::memory_order_relaxed);
+
+            // Zawsze terminuj null bajtem — obrona przed brakiem \0 w pakiecie
+            pkt.payload.text_data[sizeof(pkt.payload.text_data)-1] = '\0';
+
+            // Weryfikacja CRC32
+            // crc32_le obejmuje wszystkie bajty struktury PRZED polem crc32
+            uint32_t calc_crc    = crc32_le(0, (uint8_t*)&pkt.payload, offsetof(struct_message, crc32));
+            bool     isDataValid = (calc_crc == pkt.payload.crc32);
+
+            // Detekcja luk w sekwencji
+            uint32_t seq  = pkt.payload.seq_num;
+            uint32_t last = lastSeqNum.load(std::memory_order_relaxed);
+            if (last > 0 && seq > last + 1)
+                sequenceGaps.fetch_add(seq - last - 1, std::memory_order_relaxed);
+            lastSeqNum.store(seq, std::memory_order_relaxed);
+
+            // MAC nadawcy (identyfikacja modułu spośród 3 nadajników)
+            char macStr[18];
+            macToStr(pkt.senderMac, macStr);
+
+            // Detekcja EVENT_TYPE przez parsowanie text_data
+            // Nadajnik nie ma pola event_type w strukturze — typ zakodowany w treści.
+            //
+            // "SEQ:N TYPE:TRIGGER ACTION:CLICK" → BTN_PRESS
+            //    Kotwica czasowa ML: człowiek potwierdził wykrycie zapachu.
+            //    ROLE_TRIGGER_ONLY i ROLE_SENSOR_AND_TRIGGER — oba wysyłają ten format.
+            //
+            // Wszystkie pozostałe pakiety → TVOC
+            //    Częstotliwość wysyłania jest konfigurowalna po stronie nadajnika
+            //    i może się zmieniać w czasie. Rzeczywistą częstotliwość można
+            //    odtworzyć z kolumny TIMESTAMP w analizie post-hoc.
+            //
+            // Uwaga: CRC_ERR pakiety też klasyfikujemy — typ może być błędny,
+            // ale zachowujemy wszystkie dane do analizy offline.
+            const char* evtStr = (strstr(pkt.payload.text_data, "TYPE:TRIGGER") != nullptr)
+                                 ? "BTN_PRESS" : "TVOC";
+
+            // Budowanie linii CSV:
+            // TIMESTAMP,VERDICT,SENDER_MAC,SEQ_NUM,EVENT_TYPE,"PAYLOAD"
+            // Przykłady:
+            // 2025-06-15 14:23:01,VALID,AC:67:B2:1B:E0:C0,1234,BTN_PRESS,"SEQ:1234 TYPE:TRIGGER ACTION:CLICK"
+            // 2025-06-15 14:23:02,VALID,AC:67:B2:1B:E0:C1,0089,TVOC,"S:89 T:23.45 RH:55.10 TVOC:450 CO2:1200 rH2:14532 rEtOH:18923"
+            int len = snprintf(tempLine, TEMP_LINE_SIZE,
+                               "%s,%s,%s,%u,%s,\"",
+                               localTimeStr,
+                               isDataValid ? "VALID" : "CRC_ERR",
+                               macStr,
+                               seq,
+                               evtStr);
+
+            if (len > 0 && len < TEMP_LINE_SIZE) {
+                // RFC 4180: cudzysłowy w payload escapujemy jako ""
+                for (int i = 0;
+                     pkt.payload.text_data[i] != '\0' && len < (TEMP_LINE_SIZE - 5);
+                     i++) {
+                    if (pkt.payload.text_data[i] == '"') {
+                        tempLine[len++] = '"'; tempLine[len++] = '"';
+                    } else {
+                        tempLine[len++] = pkt.payload.text_data[i];
+                    }
+                }
+                tempLine[len++] = '"'; tempLine[len++] = '\n'; tempLine[len] = '\0';
+
+                if ((currentBufferLen + (size_t)len) < WRITE_BUFFER_SIZE) {
+                    memcpy(writeBuffer + currentBufferLen, tempLine, len);
+                    currentBufferLen += len;
+                } else {
+                    droppedPackets.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // =================================================================
+        // FLUSH BUFORA NA SD + WERYFIKACJA ROZMIARU
+        // =================================================================
+        bool timeToFlush    = (xTaskGetTickCount() - lastFlush) > pdMS_TO_TICKS(30000);
+        bool bufferNearFull = (currentBufferLen > (WRITE_BUFFER_SIZE - 512));
+
+        if ((bufferNearFull || timeToFlush) && currentBufferLen > 0 && logFile) {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                size_t bytesWritten = currentBufferLen;
+                logFile.write((const uint8_t*)writeBuffer, bytesWritten);
+                logFile.flush();
+
+                // Weryfikacja rozmiaru po flush
+                // Lekka operacja: odczyt metadanych FAT bez czytania danych
+                size_t actualSize = logFile.size();
+                expectedFileSize += bytesWritten;
+                if (actualSize < expectedFileSize) {
+                    // Plik nie urósł o oczekiwaną liczbę bajtów — błąd zapisu
+                    Serial.printf("[SD] BLAD: rozmiar %zu < oczekiwany %zu (delta: %zu B)\n",
+                                  actualSize, expectedFileSize, expectedFileSize - actualSize);
+                    xSemaphoreGive(sdMutex);
+                    sdWriteError.store(true, std::memory_order_release);
+                    // Nie robimy restartu tutaj — soft-recovery na początku następnej iteracji
+                } else {
+                    xSemaphoreGive(sdMutex);
+                    currentBufferLen = 0;
+                    lastFlush        = xTaskGetTickCount();
+                }
+            }
+        }
+
+        // =================================================================
+        // AUTOMATYCZNA ROTACJA
+        // =================================================================
+        if (!downloadInProgress.load(std::memory_order_acquire) &&
+            !sdWriteError.load(std::memory_order_acquire)) {
+            bool needRotate = ((millis() - logOpenTime) >= MAX_LOG_AGE_MS);
+            if (!needRotate) {
+                if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    if (logFile) needRotate = (logFile.size() >= MAX_LOG_SIZE_BYTES);
+                    xSemaphoreGive(sdMutex);
+                }
+            }
+            if (needRotate) {
+                Serial.println("[LOG] Auto-rotacja.");
+                IPC_Command autoCmd; autoCmd.type = CMD_ROTATE_FILE;
+                xQueueSend(controlQueue, &autoCmd, 0);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ZARZĄDZANIE SESJĄ DOWNLOAD (identyczne z v5, bez zmian)
+// =============================================================================
+bool beginDownloadSession(const char* path) {
+    if (!dlSession.bufferValid) {
+        dlSession.buffer = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!dlSession.buffer) {
+            dlSession.buffer = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (!dlSession.buffer) {
+            downloadInProgress.store(false, std::memory_order_release); return false;
+        }
+        dlSession.bufferValid = true;
+    }
+    esp_err_t e = esp_now_deinit();
+    if (e == ESP_OK) Serial.println("[SVC] ESP-NOW deinit OK.");
+    else Serial.printf("[SVC] ESP-NOW deinit warn: %d\n", e);
+    if (xSemaphoreTake(downloadReadySemaphore, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        downloadInProgress.store(false, std::memory_order_release);
+        esp_now_init(); esp_now_register_recv_cb(OnDataRecv); return false;
+    }
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        dlSession.file = SD_MMC.open(path, FILE_READ);
+        if (dlSession.file) dlSession.fileSize = dlSession.file.size();
+        xSemaphoreGive(sdMutex);
+    }
+    if (!dlSession.file || dlSession.fileSize == 0) {
+        downloadInProgress.store(false, std::memory_order_release);
+        esp_now_init(); esp_now_register_recv_cb(OnDataRecv); return false;
+    }
+    downloadSessionStart.store((uint32_t)millis(), std::memory_order_release);
+    return true;
+}
+
+void endDownloadSession() {
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (dlSession.file) dlSession.file.close();
+        xSemaphoreGive(sdMutex);
+    }
+    dlSession.fileSize = 0;
+    if (dlSession.bufferValid && dlSession.buffer) {
+        free(dlSession.buffer); dlSession.buffer = nullptr; dlSession.bufferValid = false;
+    }
+    if (esp_now_init() == ESP_OK) {
+        esp_now_register_recv_cb(OnDataRecv);
+        lastPacketMillis.store((uint32_t)millis(), std::memory_order_release);
+    }
+    downloadSessionStart.store(0, std::memory_order_release);
+    lastClientDisconnectMs.store((uint32_t)millis(), std::memory_order_release);
+    downloadInProgress.store(false, std::memory_order_release);
+}
+
+// =============================================================================
+// KONFIGURACJA SERWERA WWW
+// =============================================================================
+void configureAsyncServer() {
+    // Captive portal endpointy OS-specific
+    auto captiveRedirect = [](AsyncWebServerRequest* req) { req->redirect("http://192.168.4.1/"); };
+    server.on("/connecttest.txt",           HTTP_GET, captiveRedirect);
+    server.on("/redirect",                  HTTP_GET, captiveRedirect);
+    server.on("/hotspot-detect.html",       HTTP_GET, captiveRedirect);
+    server.on("/canonical.html",            HTTP_GET, captiveRedirect);
+    server.on("/success.txt",               HTTP_GET, captiveRedirect);
+    server.on("/generate_204",              HTTP_GET, captiveRedirect);
+    server.on("/gen_204",                   HTTP_GET, captiveRedirect);
+    server.on("/library/test/success.html", HTTP_GET, captiveRedirect);
+    server.on("/kindle-wifi/wifistub.html", HTTP_GET, captiveRedirect);
+
+    // GET /
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+        if (!sdMounted.load(std::memory_order_acquire)) {
+            request->send(500, "text/plain", "SD niedostepna"); return;
+        }
+        String html = FPSTR(MANAGER_HTML);
+        html.replace("%%BANNER%%",
+            downloadInProgress.load(std::memory_order_acquire)
+            ? "<div class='banner banner-svc'>&#9889; TRYB SERWISOWY &mdash; logowanie wstrzymane.</div>"
+            : "");
+        String sdInfo="", fileList="";
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            char localCur[64]; strncpy(localCur, currentFileName, 63); localCur[63]='\0';
+            uint32_t tot=(uint32_t)(SD_MMC.totalBytes()/(1024*1024));
+            uint32_t use=(uint32_t)(SD_MMC.usedBytes()/(1024*1024));
+            char buf[80]; snprintf(buf,sizeof(buf),"<p style='font-size:.82rem;color:#64748b'>SD: <b>%u MB</b> / %u MB</p>",use,tot);
+            sdInfo=buf;
+            File root=SD_MMC.open("/");
+            if(root){
+                File f=root.openNextFile(); int cnt=0;
+                while(f && cnt<MAX_FILES_LISTED){
+                    char nm[64]; strncpy(nm,f.name(),63); nm[63]='\0';
+                    char* disp=(nm[0]=='/')?nm+1:nm;
+                    char full[70]; snprintf(full,sizeof(full),"/%s",disp);
+                    uint32_t kb=(uint32_t)(f.size()/1024); f.close();
+                    if(strstr(disp,".csv")&&strcmp(full,localCur)!=0){
+                        fileList+="<li><span class='fname'>";fileList+=disp;
+                        fileList+="</span><span class='fsize'>";fileList+=kb;fileList+=" KB</span>";
+                        fileList+="<span class='fbtns'>";
+                        fileList+="<button class='btn acc' onclick=\"dlFile('";fileList+=disp;fileList+="')\">&#8659;</button>";
+                        fileList+="<button class='btn red' onclick=\"delFile('";fileList+=disp;fileList+="')\">&#128465;</button>";
+                        fileList+="</span></li>"; cnt++;
+                    }
+                    f=root.openNextFile();
+                }
+                if(f){fileList+="<li style='font-size:.78rem;color:red'>... limit 50</li>";f.close();}
+                root.close();
+            }
+            xSemaphoreGive(sdMutex);
+        } else { sdInfo="<p style='color:red'>VFS zajety.</p>"; }
+        html.replace("%%SDINFO%%", sdInfo);
+        html.replace("%%FILELIST%%", fileList);
+        AsyncWebServerResponse* resp=request->beginResponse(200,"text/html",html);
+        resp->addHeader("Cache-Control","no-store");
+        request->send(resp);
+    });
+
+    // GET /filelist
+    server.on("/filelist", HTTP_GET, [](AsyncWebServerRequest* request) {
+        String json="["; bool first=true;
+        if(xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000))==pdTRUE){
+            char localCur[64]; strncpy(localCur,currentFileName,63); localCur[63]='\0';
+            File root=SD_MMC.open("/");
+            if(root){
+                File f=root.openNextFile(); int cnt=0;
+                while(f && cnt<MAX_FILES_LISTED){
+                    char nm[64]; strncpy(nm,f.name(),63); nm[63]='\0';
+                    char* disp=(nm[0]=='/')?nm+1:nm;
+                    char full[70]; snprintf(full,sizeof(full),"/%s",disp);
+                    f.close();
+                    if(strstr(disp,".csv")&&strcmp(full,localCur)!=0){
+                        if(!first)json+=",";
+                        json+="\"";json+=disp;json+="\"";
+                        first=false; cnt++;
+                    }
+                    f=root.openNextFile();
+                }
+                root.close();
+            }
+            xSemaphoreGive(sdMutex);
+        }
+        json+="]";
+        request->send(200,"application/json",json);
+    });
+
+    server.on("/svc_status", HTTP_GET, [](AsyncWebServerRequest* request) {
+        bool ready = loggerResumed.load(std::memory_order_acquire) &&
+                     !downloadInProgress.load(std::memory_order_acquire);
+        request->send(200, "text/plain", ready ? "READY" : "BUSY");
+    });
+
+    server.on("/rotation_status", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->send(200, "text/plain",
+            fileRotationComplete.load(std::memory_order_acquire) ? "DONE" : "PENDING");
+    });
+
+    // GET /download
+    server.on("/download", HTTP_GET, [](AsyncWebServerRequest* request) {
+        uint32_t lastDisc = lastClientDisconnectMs.load(std::memory_order_acquire);
+        if (lastDisc>0 && ((uint32_t)millis()-lastDisc)<SVC_DEADTIME_MS) {
+            char msg[64]; snprintf(msg,sizeof(msg),"Deadtime. Poczekaj %lu s.",(unsigned long)((SVC_DEADTIME_MS-((uint32_t)millis()-lastDisc))/1000));
+            request->send(503,"text/plain",msg); return;
+        }
+        if (!request->hasParam("file")) { request->send(400,"text/plain","Brak parametru file"); return; }
+        char fileName[64]; strncpy(fileName,request->getParam("file")->value().c_str(),63); fileName[63]='\0';
+        if (!isFileNameSafe(fileName)) { request->send(400,"text/plain","Niedozwolona nazwa"); return; }
+        char path[70]; snprintf(path,sizeof(path),"/%s",fileName);
+        bool isActive=false;
+        if(xSemaphoreTake(sdMutex,pdMS_TO_TICKS(500))==pdTRUE){
+            isActive=(strcmp(path,currentFileName)==0); xSemaphoreGive(sdMutex);
+        }
+        if(isActive){request->send(403,"text/plain","Aktywny log."); return;}
+        bool expected=false;
+        if(!downloadInProgress.compare_exchange_strong(expected,true,std::memory_order_acq_rel,std::memory_order_acquire)){
+            request->send(503,"text/plain","Pobieranie w toku."); return;
+        }
+        if(!beginDownloadSession(path)){request->send(500,"text/plain","Blad sesji."); return;}
+        size_t totalSize=dlSession.fileSize;
+        String safeFileName(fileName);
+        AsyncWebServerResponse* response=request->beginResponse(
+            totalSize,"application/octet-stream",
+            [totalSize](uint8_t* buffer,size_t maxLen,size_t index)->size_t{
+                if(index>=totalSize){endDownloadSession();return 0;}
+                size_t toRead=totalSize-index;
+                if(toRead>maxLen)toRead=maxLen;
+                if(toRead>DOWNLOAD_BUFFER_SIZE)toRead=DOWNLOAD_BUFFER_SIZE;
+                size_t bytesRead=0;
+                if(xSemaphoreTake(sdMutex,pdMS_TO_TICKS(500))==pdTRUE){
+                    if(dlSession.file){
+                        if(dlSession.file.position()!=index)dlSession.file.seek(index);
+                        uint8_t* dst=(dlSession.bufferValid&&dlSession.buffer)?dlSession.buffer:buffer;
+                        bytesRead=dlSession.file.read(dst,toRead);
+                        if(dst!=buffer&&bytesRead>0){
+                            size_t cp=(bytesRead<maxLen)?bytesRead:maxLen;
+                            memcpy(buffer,dst,cp);bytesRead=cp;
+                        }
+                    }
+                    xSemaphoreGive(sdMutex);
+                }
+                if(bytesRead==0&&index<totalSize){endDownloadSession();}
+                return bytesRead;
+            });
+        response->addHeader("Content-Disposition","attachment; filename=\""+safeFileName+"\"");
+        response->addHeader("Accept-Ranges","none");
+        request->send(response);
+    });
+
+    server.on("/rotate", HTTP_POST, [](AsyncWebServerRequest* request) {
+        if(downloadInProgress.load(std::memory_order_acquire)){request->send(503,"text/plain","SVC aktywny.");return;}
+        fileRotationComplete.store(false,std::memory_order_release);
+        IPC_Command cmd; cmd.type=CMD_ROTATE_FILE;
+        if(xQueueSend(controlQueue,&cmd,pdMS_TO_TICKS(100))!=pdTRUE){
+            fileRotationComplete.store(true,std::memory_order_release);
+            request->send(503,"text/plain","Kolejka pelna.");return;
+        }
+        request->send(202,"text/plain","Rotacja zlecona.");
+    });
+
+    server.on("/delete", HTTP_POST, [](AsyncWebServerRequest* request) {
+        if(downloadInProgress.load(std::memory_order_acquire)){request->send(503,"text/plain","SVC aktywny.");return;}
+        if(!request->hasParam("file",true)){request->send(400,"text/plain","Brak file");return;}
+        char fn[64]; strncpy(fn,request->getParam("file",true)->value().c_str(),63); fn[63]='\0';
+        if(!isFileNameSafe(fn)){request->send(400,"text/plain","Niedozwolona nazwa");return;}
+        IPC_Command cmd; cmd.type=CMD_DELETE_FILE;
+        strncpy(cmd.targetFile,fn,63); cmd.targetFile[63]='\0';
+        if(xQueueSend(controlQueue,&cmd,pdMS_TO_TICKS(100))!=pdTRUE){request->send(503,"text/plain","Kolejka pelna.");return;}
+        request->send(202,"text/plain","Usuniecie zlecone.");
+    });
+
+    server.on("/clear", HTTP_POST, [](AsyncWebServerRequest* request) {
+        if(downloadInProgress.load(std::memory_order_acquire)){request->send(503,"text/plain","SVC aktywny.");return;}
+        IPC_Command cmd; cmd.type=CMD_CLEAR_ALL;
+        if(xQueueSend(controlQueue,&cmd,pdMS_TO_TICKS(100))!=pdTRUE){request->send(503,"text/plain","Kolejka pelna.");return;}
+        request->send(202,"text/plain","Czyszczenie zlecone.");
+    });
+
+    server.onNotFound([](AsyncWebServerRequest* request){ request->redirect("http://192.168.4.1/"); });
+}
+
+// =============================================================================
+// SETUP
+// =============================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(100);
+    Serial.println("\n[BOOT] ESP32-CAM SD Logger Gateway v6.0");
+
+    sdMutex = xSemaphoreCreateMutex();
+    downloadReadySemaphore = xSemaphoreCreateBinary();
+    if (!sdMutex || !downloadReadySemaphore) {
+        Serial.println("[FATAL] Semafory!"); while(true) delay(1000);
+    }
+
+    esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+    esp_task_wdt_add(NULL);
+
+    WiFi.onEvent(WiFiEvent);
+    pinMode(RED_LED_PIN, OUTPUT);
+    pinMode(MANAGER_BUTTON_PIN, INPUT_PULLUP);
+    digitalWrite(RED_LED_PIN, HIGH);
+
+    rxQueue      = xQueueCreate(48, sizeof(QueuedPacket));  // 48×158B = ~7.6KB
+    controlQueue = xQueueCreate(10, sizeof(IPC_Command));
+    if (!rxQueue || !controlQueue) {
+        Serial.println("[FATAL] Kolejki!"); while(true) delay(1000);
+    }
+
+    prefs.begin("tvoc_sys", false);
+    bootCountGlobal = prefs.getUInt("bc", 0);
+    if (bootCountGlobal >= 3) {
+        isCaptivePortalMode = true; prefs.putUInt("bc", 0);
+    } else {
+        prefs.putUInt("bc", bootCountGlobal + 1);
+        prefs.getString("pass", apPassword, sizeof(apPassword));
+        if (strlen(apPassword) < 8) strcpy(apPassword, "admin123");
+    }
+
+    setLedMode(LED_BOOT);
+    configureAsyncServer();
+    server.begin();
+    changeState(INIT_WIFI);
+
+    // MAC STA — stały adres sprzętowy, dostępny bez aktywnego WiFi.
+    // Ten adres wpisz do pola receiverMAC we wszystkich nadajnikach (sondach).
+    // MAC AP = MAC STA + 1 na ostatnim oktecie — NIE używaj go dla ESP-NOW.
+    uint8_t staMac[6], apMac[6];
+    esp_read_mac(staMac, ESP_MAC_WIFI_STA);
+    esp_read_mac(apMac,  ESP_MAC_WIFI_SOFTAP);
+    Serial.printf("[BOOT] MAC STA (wpisz do sondy): %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  staMac[0], staMac[1], staMac[2], staMac[3], staMac[4], staMac[5]);
+    Serial.printf("[BOOT] MAC AP  (informacyjnie):  %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  apMac[0],  apMac[1],  apMac[2],  apMac[3],  apMac[4],  apMac[5]);
+
+    Serial.printf("[BOOT] SRAM:%uKB PSRAM:%uKB\n",
+                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024,
+                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
+}
+
+// =============================================================================
+// GŁÓWNA PĘTLA (Core 1)
+// =============================================================================
+void loop() {
+    esp_task_wdt_reset();
+    unsigned long nowMs = millis();
+
+    ledUpdate();
+
+    // DNS bez throttle (nieblokujące, krytyczne dla captive portal)
+    dnsServer.processNextRequest();
+
+    if (!bootCountCleared && nowMs > 5000) {
+        prefs.putUInt("bc", 0); bootCountCleared = true;
+    }
+
+    // Telemetria co 30s
+    static unsigned long lastTel = 0;
+    if (nowMs - lastTel > 30000) {
+        uint32_t hwm = loggerTaskHandle
+                       ? uxTaskGetStackHighWaterMark(loggerTaskHandle) * sizeof(StackType_t) : 0;
+        Serial.printf("[TEL] SRAM:%uKB LFB:%uKB PSRAM:%uKB Drop:%u Gap:%u SD:%s SVC:%s WErr:%s HWM:%uB\n",
+            heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024,
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)/1024,
+            heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024,
+            droppedPackets.load(std::memory_order_relaxed),
+            sequenceGaps.load(std::memory_order_relaxed),
+            sdMounted.load()?"OK":"ERR",
+            downloadInProgress.load()?"ON":"off",
+            sdWriteError.load()?"YES":"no",
+            hwm);
+        lastTel = nowMs;
+    }
+
+    // Watchdog sesji serwisowej
+    uint32_t svcStart = downloadSessionStart.load(std::memory_order_acquire);
+    if (svcStart>0 && downloadInProgress.load(std::memory_order_acquire) &&
+        (nowMs-svcStart)>SVC_SESSION_TIMEOUT_MS) {
+        Serial.println("[WDG] Timeout sesji – force end."); endDownloadSession();
+    }
+
+    // Watchdog ESP-NOW
+    uint32_t lastPkt  = lastPacketMillis.load(std::memory_order_relaxed);
+    uint32_t lastDisc = lastClientDisconnectMs.load(std::memory_order_acquire);
+    bool     inDeadtime = (lastDisc>0 && (nowMs-lastDisc)<SVC_DEADTIME_MS);
+    if (currentState==RUNNING && !downloadInProgress.load(std::memory_order_acquire) &&
+        !inDeadtime && lastPkt>0 && (nowMs-lastPkt)>180000) {
+        Serial.println("[FATAL] ESP-NOW gluchy 3min. Restart."); ESP.restart();
+    }
+
+    // LED nadpisanie dla stanów serwisowych
+    if (downloadInProgress.load(std::memory_order_acquire)) setLedMode(LED_SERVICE_MODE);
+    else if (sdWriteError.load(std::memory_order_acquire))  setLedMode(LED_ERROR_SD);
+    else if (inDeadtime && currentState==RUNNING)           setLedMode(LED_DEADTIME);
+
+    // =========================================================================
+    // MASZYNA STANÓW
+    // =========================================================================
+    switch (currentState) {
+
+    case INIT_WIFI:
+        setLedMode(LED_BOOT);
+        if (isCaptivePortalMode) { changeState(INIT_SD); break; }
+        WiFi.begin(ssid, password);
+        changeState(WAIT_WIFI);
+        break;
+
+    case WAIT_WIFI:
+        setLedMode(LED_WIFI_WAIT);
+        if (WiFi.status()==WL_CONNECTED) {
+            // Zapamiętaj kanał STA TERAZ — po DISCONNECT_STA WiFi.status()
+            // nie będzie już WL_CONNECTED, więc odczyt kanału tam jest niemożliwy.
+            // ESP-NOW musi działać na tym samym kanale co AP.
+            // Jeśli STA nie połączyło się (offline), operatingChannel pozostaje 1.
+            operatingChannel = WiFi.channel();
+            Serial.printf("[WiFi] STA: %s kanal: %u\n",
+                          WiFi.localIP().toString().c_str(), operatingChannel);
+            changeState(SYNC_NTP);
+        } else if (nowMs-stateEnterTime>8000) {
+            Serial.println("[WiFi] Timeout – offline, kanal AP: 1.");
+            changeState(INIT_SD);
+        }
+        break;
+
+    case SYNC_NTP:
+        setLedMode(LED_NTP_WAIT);
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        changeState(WAIT_NTP);
+        break;
+
+    case WAIT_NTP: {
+        setLedMode(LED_NTP_WAIT);
+        struct tm ti;
+        if (getLocalTime(&ti, 0)) {
+            Serial.println("[NTP] Sync OK.");
+            changeState(DISCONNECT_STA);
+        } else if (nowMs-stateEnterTime>15000) {
+            Serial.println("[NTP] Timeout – offline."); changeState(DISCONNECT_STA);
+        }
+        break;
+    }
+
+    // -------------------------------------------------------------------------
+    // [v6] DISCONNECT_STA — odłączenie STA po NTP
+    // Cel: eliminacja half-duplex jitter radia przy ESP-NOW
+    //
+    // Sekwencja:
+    //   1. WiFi.disconnect(true) — rozłącza STA i wyłącza auto-reconnect
+    //   2. WiFi.mode(WIFI_AP_STA) nadal aktywny — AP jest w tym samym trybie,
+    //      ale STA nie jest skojarzony z żadną siecią
+    //   3. Opcjonalnie WiFi.mode(WIFI_AP) — przełącza radio wyłącznie na AP
+    //      Robimy to po odłączeniu, żeby uniknąć chwilowego wyłączenia AP
+    //
+    // UWAGA: Nie możemy wywołać WiFi.mode(WIFI_AP) przed INIT_AP, bo AP jeszcze
+    // nie jest uruchomiony. Ta sekwencja jest poprawna: STA łączy się→NTP→
+    // disconnect STA → INIT_AP (AP startuje w WIFI_AP lub WIFI_AP_STA).
+    // -------------------------------------------------------------------------
+    case DISCONNECT_STA:
+        staDisconnected = true;     // Flaga: ignoruj zdarzenie DISCONNECTED w WiFiEvent
+        WiFi.disconnect(true);      // Rozłącz STA, wyłącz auto-reconnect
+        vTaskDelay(pdMS_TO_TICKS(100)); // Krótkie czekanie na obsługę eventu WiFi
+        // Przełącz na tryb AP-only jeśli NTP się udało (mamy czas)
+        // Jeśli NTP nie wyszło (offline), zostawiamy WIFI_AP_STA na wypadek późniejszego
+        // podłączenia — w tym projekcie nie robimy re-sync NTP więc to nieistotne,
+        // ale zostawiamy WIFI_AP_STA jako bezpieczniejszy fallback.
+        Serial.println("[WiFi] STA odłączone. Radio wyłącznie dla AP + ESP-NOW.");
+        changeState(INIT_SD);
+        break;
+
+    case INIT_SD:
+        setLedMode(LED_SD_INIT);
+        if (!sdMounted.load(std::memory_order_acquire)) {
+            if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000))==pdTRUE) {
+                uint8_t retries=0;
+                while (!SD_MMC.begin("/sdcard",true) && retries<3) {
+                    Serial.printf("[SD] Montowanie %d/3\n",++retries);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+                if (retries<3) {
+                    sdMounted.store(true,std::memory_order_release);
+                    Serial.printf("[SD] OK: %llu MB\n",SD_MMC.totalBytes()/(1024*1024));
+                } else { Serial.println("[SD] BLAD montowania!"); }
+                xSemaphoreGive(sdMutex);
+            }
+        }
+        if (sdMounted.load() && checkSDFreeSpace()) changeState(INIT_AP);
+        else { Serial.println("[SD] Niedostepna/pelna!"); setLedMode(LED_ERROR_SD); changeState(SYSTEM_ERROR); }
+        break;
+
+    case INIT_AP:
+        setLedMode(LED_AP_INIT);
+        // operatingChannel został ustawiony w WAIT_WIFI (gdy STA połączone)
+        // lub pozostaje 1 (fallback offline). W obu przypadkach jest poprawny.
+        // Odczyt WiFi.channel() tutaj byłby martwy — STA jest już odłączone.
+        WiFi.mode(WIFI_AP_STA);
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(operatingChannel, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+        WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),IPAddress(255,255,255,0));
+        WiFi.softAP("TVOC_Receptor", apPassword, operatingChannel, 0, 2);
+        dnsServer.setTTL(0);
+        dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+        dnsServer.start(53,"*",WiFi.softAPIP());
+        Serial.printf("[AP] TVOC_Receptor kanal %d\n", operatingChannel);
+        changeState(OPEN_FILE);
+        break;
+
+    case OPEN_FILE: {
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000))==pdTRUE) {
+            struct tm tInfo; int ret;
+            if (getLocalTime(&tInfo,0))
+                ret=snprintf(currentFileName,sizeof(currentFileName),
+                             "/LOG_%04d%02d%02d_%02d%02d%02d.csv",
+                             tInfo.tm_year+1900,tInfo.tm_mon+1,tInfo.tm_mday,
+                             tInfo.tm_hour,tInfo.tm_min,tInfo.tm_sec);
+            else
+                ret=snprintf(currentFileName,sizeof(currentFileName),"/LOG_BOOT_%u.csv",bootCountGlobal);
+            if(ret<=0||ret>=(int)sizeof(currentFileName))
+                snprintf(currentFileName,sizeof(currentFileName),"/LOG_FALLBACK.csv");
+            Serial.printf("[FILE] Log: %s\n",currentFileName);
+            xSemaphoreGive(sdMutex);
+        }
+        changeState(INIT_ESPNOW);
+        break;
+    }
+
+    case INIT_ESPNOW:
+        if (esp_now_init()==ESP_OK) {
+            esp_now_register_recv_cb(OnDataRecv);
+            lastPacketMillis.store((uint32_t)millis(),std::memory_order_relaxed);
+            xTaskCreatePinnedToCore(sdLoggerTask,"SD_Logger",12288,NULL,1,&loggerTaskHandle,1);
+            Serial.println("[ESP-NOW] OK. RUNNING.");
+            setLedMode(LED_RUNNING);
+            changeState(RUNNING);
+        } else {
+            Serial.println("[ESP-NOW] BLAD!");
+            setLedMode(LED_ERROR_ESPNOW); changeState(SYSTEM_ERROR);
+        }
+        break;
+
+    case RUNNING:
+        if (!downloadInProgress.load() && !inDeadtime && !sdWriteError.load())
+            setLedMode(LED_RUNNING);
+        if (!sdMounted.load(std::memory_order_acquire)) {
+            Serial.println("[SD] Karta utracila gotowos!");
+            setLedMode(LED_ERROR_SD); changeState(SYSTEM_ERROR);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        break;
+
+    case SYSTEM_ERROR:
+    case ERROR_SD_FULL:
+        vTaskDelay(pdMS_TO_TICKS(10));
+        break;
+
+    default: break;
+    }
+}
+
+// =============================================================================
+// KONIEC PLIKU — v6.0
+// struct_message: identyczna z nadajnikiem ESP32-C3, 152B, bez modyfikacji
+// EVENT_TYPE: strstr("TYPE:TRIGGER") → BTN_PRESS, else → TVOC (częstotliwość z TIMESTAMP)
+// SENDER_MAC: z callbacku OnDataRecv, identyfikacja 3 modułów
+// STA odłączane po NTP (stan DISCONNECT_STA) — czyste radio dla AP+ESP-NOW
+// Soft-recovery SD: 3 próby remount z rosnącym opóźnieniem przed ESP.restart()
+// Weryfikacja rozmiaru po flush: lekka (stat FAT), bez re-read danych
+// CSV: TIMESTAMP,VERDICT,SENDER_MAC,SEQ_NUM,EVENT_TYPE,PAYLOAD
+// =============================================================================
